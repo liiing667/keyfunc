@@ -227,18 +227,12 @@ func TestNewDefaultOverrideCtxPrioritizeHTTP(t *testing.T) {
 
 	tc := map[string]struct {
 		prioritizeHTTP bool
-		valid          string
-		invalid        string
 	}{
 		"Given first": {
 			prioritizeHTTP: false,
-			valid:          givenSigned,
-			invalid:        httpSigned,
 		},
 		"HTTP first": {
 			prioritizeHTTP: true,
-			valid:          httpSigned,
-			invalid:        givenSigned,
 		},
 	}
 	for name, tt := range tc {
@@ -250,13 +244,16 @@ func TestNewDefaultOverrideCtxPrioritizeHTTP(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Failed to create keyfunc. Error: %s", err)
 			}
-			_, err = jwt.Parse(tt.valid, k.Keyfunc)
-			if err != nil {
-				t.Fatalf("Failed to parse JWT signed by the prioritized key. Error: %s", err)
+			// Two distinct keys share the same kid and the same algorithm, so their key identity is ambiguous. The
+			// keyfunc must fail closed instead of letting whichever key is enumerated first decide verification,
+			// otherwise a retired or attacker-controlled shadow key can verify tokens meant for the current key.
+			_, err = jwt.Parse(givenSigned, k.Keyfunc)
+			if !errors.Is(err, jwt.ErrTokenUnverifiable) {
+				t.Fatalf("Expected jwt.ErrTokenUnverifiable for ambiguous same-kid identity (given), but got %v.", err)
 			}
-			_, err = jwt.Parse(tt.invalid, k.Keyfunc)
-			if !errors.Is(err, jwt.ErrTokenSignatureInvalid) {
-				t.Fatalf("Expected jwt.ErrTokenSignatureInvalid for JWT signed by the shadowed key, but got %v.", err)
+			_, err = jwt.Parse(httpSigned, k.Keyfunc)
+			if !errors.Is(err, jwt.ErrTokenUnverifiable) {
+				t.Fatalf("Expected jwt.ErrTokenUnverifiable for ambiguous same-kid identity (HTTP), but got %v.", err)
 			}
 		})
 	}

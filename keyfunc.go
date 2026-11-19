@@ -3,11 +3,15 @@ package keyfunc
 import (
 	"context"
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/rsa"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"reflect"
 	"slices"
 	"time"
 
@@ -231,34 +235,37 @@ func (k keyfunc) KeyfuncCtx(ctx context.Context) jwt.Keyfunc {
 			// without an alg parameter in the header before calling jwt.Keyfunc.
 			return nil, fmt.Errorf(`%w: the JWT header did not contain the "alg" parameter, which is required by RFC 7515 section 4.1.1`, ErrKeyfunc)
 		}
+
+		var (
+			candidates []jwkset.JWK
+			err        error
+		)
+		kid := ""
 		kidInter, ok := token.Header[jwkset.HeaderKID]
 		if !ok {
-			return k.verificationKeySet(ctx, alg)
-		}
-		kid, ok := kidInter.(string)
-		if !ok {
-			return nil, fmt.Errorf("%w: could not convert kid in JWT header to string", ErrKeyfunc)
+			candidates, err = k.storage.KeyReadAll(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read all JWK from storage: %w", errors.Join(err, ErrKeyfunc))
+			}
+		} else {
+			kid, ok = kidInter.(string)
+			if !ok {
+				return nil, fmt.Errorf("%w: could not convert kid in JWT header to string", ErrKeyfunc)
+			}
+			candidates, err = k.candidatesForKID(ctx, kid)
+			if err != nil {
+				return nil, err
+			}
 		}
 
-		jwk, err := k.storage.KeyRead(ctx, kid)
+		keySet, err := k.verificationKeys(token.Method, alg, kid, candidates, true)
 		if err != nil {
-			return nil, fmt.Errorf("%w: could not read JWK from storage", errors.Join(err, ErrKeyfunc))
+			return nil, err
 		}
-
-		if a := jwk.Marshal().ALG.String(); a != "" && a != alg {
-			return nil, fmt.Errorf(`%w: JWK "alg" parameter value %q does not match token "alg" parameter value %q`, ErrKeyfunc, a, alg)
+		if len(keySet.Keys) == 1 {
+			return keySet.Keys[0], nil
 		}
-		if !k.useAllowed(jwk) {
-			return nil, fmt.Errorf(`%w: JWK "use" parameter value %q is not in whitelist`, ErrKeyfunc, jwk.Marshal().USE)
-		}
-
-		key := jwk.Key()
-		pk, ok := key.(publicKeyer)
-		if ok {
-			key = pk.Public()
-		}
-
-		return key, nil
+		return keySet, nil
 	}
 }
 func (k keyfunc) Keyfunc(token *jwt.Token) (any, error) {
@@ -269,36 +276,158 @@ func (k keyfunc) Storage() jwkset.Storage {
 	return k.storage
 }
 func (k keyfunc) VerificationKeySet(ctx context.Context) (jwt.VerificationKeySet, error) {
-	return k.verificationKeySet(ctx, "")
-}
-
-// verificationKeySet returns every key in storage that passes the same checks applied to a JWT with a kid header. If
-// alg is empty, the JWK "alg" parameter is not checked.
-func (k keyfunc) verificationKeySet(ctx context.Context, alg string) (jwt.VerificationKeySet, error) {
-	jwk, err := k.storage.KeyReadAll(ctx)
+	jwks, err := k.storage.KeyReadAll(ctx)
 	if err != nil {
 		return jwt.VerificationKeySet{}, fmt.Errorf("failed to read all JWK from storage: %w", errors.Join(err, ErrKeyfunc))
 	}
-	var allKeys jwt.VerificationKeySet
-	for _, j := range jwk {
-		if a := j.Marshal().ALG.String(); alg != "" && a != "" && a != alg {
-			continue
-		}
-		if !k.useAllowed(j) {
-			continue
-		}
-		key := j.Key()
-		pk, ok := key.(publicKeyer)
-		if ok {
-			key = pk.Public()
-		}
-		allKeys.Keys = append(allKeys.Keys, key)
+	return k.verificationKeys(nil, "", "", jwks, false)
+}
+
+// candidatesForKID returns every JWK in storage that carries the given kid. KeyRead is preferred so that the refresh
+// and priority behavior of the underlying storage is preserved, but every other JWK sharing the same kid is still
+// enumerated. Enumerating the whole set instead of trusting the first match prevents a shadowed or retired key from
+// silently deciding the key identity.
+func (k keyfunc) candidatesForKID(ctx context.Context, kid string) ([]jwkset.JWK, error) {
+	first, err := k.storage.KeyRead(ctx, kid)
+	if err != nil {
+		return nil, fmt.Errorf("%w: could not read JWK from storage", errors.Join(err, ErrKeyfunc))
 	}
-	return allKeys, nil
+	all, err := k.storage.KeyReadAll(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read all JWK from storage: %w", errors.Join(err, ErrKeyfunc))
+	}
+	candidates := make([]jwkset.JWK, 0, 1)
+	for _, j := range all {
+		if j.Marshal().KID == kid {
+			candidates = append(candidates, j)
+		}
+	}
+	if len(candidates) == 0 {
+		candidates = append(candidates, first)
+	}
+	return candidates, nil
+}
+
+// verificationKeys binds the token's signing input (method and alg) together with each candidate JWK's alg, use, and
+// key_ops parameters into a single key identity. Candidates that cannot participate in signature verification are
+// rejected before any signature is checked. When kid is non-empty, every surviving candidate must represent the same
+// key material; otherwise the identity is ambiguous and verification fails closed. A nil method skips the signing
+// input and conflict checks, which is only used by VerificationKeySet without a token context.
+func (k keyfunc) verificationKeys(method jwt.SigningMethod, alg, kid string, candidates []jwkset.JWK, tokenContext bool) (jwt.VerificationKeySet, error) {
+	if tokenContext && !isKnownSigningMethod(method) {
+		return jwt.VerificationKeySet{}, fmt.Errorf(`%w: unknown or unsupported JWT signing method %q`, ErrKeyfunc, method.Alg())
+	}
+
+	var keySet jwt.VerificationKeySet
+	var acceptedMaterial any
+	for _, candidate := range candidates {
+		if !k.identityMatches(candidate, method, alg, tokenContext) {
+			continue
+		}
+		publicKey := publicMaterial(candidate)
+		if tokenContext && kid != "" && acceptedMaterial != nil && !reflect.DeepEqual(acceptedMaterial, publicKey) {
+			return jwt.VerificationKeySet{}, fmt.Errorf(
+				`%w: multiple JWKs with kid %q match token alg %q but contain different key material; refusing to verify an ambiguous key identity`,
+				ErrKeyfunc, kid, alg)
+		}
+		acceptedMaterial = publicKey
+
+		duplicate := false
+		for _, existing := range keySet.Keys {
+			if reflect.DeepEqual(existing, publicKey) {
+				duplicate = true
+				break
+			}
+		}
+		if duplicate {
+			continue
+		}
+		keySet.Keys = append(keySet.Keys, publicKey)
+	}
+
+	if len(keySet.Keys) == 0 {
+		if kid != "" {
+			return jwt.VerificationKeySet{}, fmt.Errorf(
+				`%w: no JWK with kid %q forms a matching identity for token alg %q (check alg, use, key_ops, and key type)`,
+				ErrKeyfunc, kid, alg)
+		}
+		return jwt.VerificationKeySet{}, fmt.Errorf(
+			`%w: no JWK in storage forms a matching identity for token alg %q (check alg, use, key_ops, and key type)`,
+			ErrKeyfunc, alg)
+	}
+	return keySet, nil
+}
+
+// identityMatches reports whether the alg, use, key_ops, and signing input of a JWK jointly match the token's identity.
+// Every failure mode rejects the candidate rather than falling back to another interpretation.
+func (k keyfunc) identityMatches(candidate jwkset.JWK, method jwt.SigningMethod, alg string, tokenContext bool) bool {
+	metadata := candidate.Marshal()
+
+	// A JWK that pins an alg can only verify tokens using that exact algorithm.
+	if tokenContext && metadata.ALG.String() != "" && metadata.ALG.String() != alg {
+		return false
+	}
+
+	// Signature verification requires a signing key. Keys explicitly marked for encryption are rejected, while keys
+	// without a use parameter remain usable subject to the configured whitelist.
+	if metadata.USE != "" && metadata.USE != jwkset.UseSig {
+		return false
+	}
+	if !k.useAllowed(candidate) {
+		return false
+	}
+
+	// When key_ops is present, it must authorize the verify operation per RFC 7517 section 4.3. An absent key_ops
+	// parameter imposes no operation restriction.
+	if len(metadata.KEYOPS) > 0 && !slices.Contains(metadata.KEYOPS, jwkset.KeyOpsVerify) {
+		return false
+	}
+
+	// The key type must be compatible with the token's signing method before verification is attempted. This closes
+	// algorithm-confusion paths such as feeding an HMAC secret into an RSA verifier or vice versa.
+	if tokenContext && !keyTypeMatchesMethod(publicMaterial(candidate), method) {
+		return false
+	}
+	return true
 }
 
 func (k keyfunc) useAllowed(jwk jwkset.JWK) bool {
 	return len(k.useWhitelist) == 0 || slices.Contains(k.useWhitelist, jwk.Marshal().USE)
+}
+
+func publicMaterial(jwk jwkset.JWK) any {
+	key := jwk.Key()
+	if pk, ok := key.(publicKeyer); ok {
+		return pk.Public()
+	}
+	return key
+}
+
+func isKnownSigningMethod(method jwt.SigningMethod) bool {
+	switch method.(type) {
+	case *jwt.SigningMethodHMAC, *jwt.SigningMethodRSA, *jwt.SigningMethodRSAPSS,
+		*jwt.SigningMethodECDSA, *jwt.SigningMethodEd25519:
+		return true
+	}
+	return false
+}
+
+func keyTypeMatchesMethod(key any, method jwt.SigningMethod) bool {
+	switch method.(type) {
+	case *jwt.SigningMethodHMAC:
+		_, ok := key.([]byte)
+		return ok
+	case *jwt.SigningMethodRSA, *jwt.SigningMethodRSAPSS:
+		_, ok := key.(*rsa.PublicKey)
+		return ok
+	case *jwt.SigningMethodECDSA:
+		_, ok := key.(*ecdsa.PublicKey)
+		return ok
+	case *jwt.SigningMethodEd25519:
+		_, ok := key.(ed25519.PublicKey)
+		return ok
+	}
+	return false
 }
 
 type publicKeyer interface {
