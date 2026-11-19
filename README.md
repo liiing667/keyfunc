@@ -74,6 +74,15 @@ provides the below features, and more:
 * Support for private asymmetric keys.
 * Specified key operations and usage.
 
+## Duplicate key ID protection
+
+Before a remote JWK Set is cached, its keys are inspected for duplicate `kid` values. Two keys sharing the same `kid`
+may only coexist when their roles cannot overlap for a given token: both must declare a different, non-empty `use` and
+a different, non-empty `alg`. Byte-identical duplicate JWKs are collapsed, while any other ambiguous set makes
+construction or refresh fail closed with `keyfunc.ErrAmbiguousKID`. On a rejected refresh the previously cached, known
+good key set is retained, so a malicious endpoint cannot make the verifier select a public key based on the response
+order. Distinct `kid` values and normal key rotation continue to work unchanged.
+
 ## Related projects
 
 ### [`github.com/MicahParks/jwkset`](https://github.com/MicahParks/jwkset):

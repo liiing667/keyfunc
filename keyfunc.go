@@ -97,14 +97,7 @@ func NewDefault(urls []string) (Keyfunc, error) {
 //
 // This will launch "refresh goroutine" to automatically refresh the remote HTTP resources.
 func NewDefaultCtx(ctx context.Context, urls []string) (Keyfunc, error) {
-	client, err := jwkset.NewDefaultHTTPClientCtx(ctx, urls)
-	if err != nil {
-		return nil, err
-	}
-	options := Options{
-		Storage: client,
-	}
-	return New(options)
+	return NewDefaultOverrideCtx(ctx, urls, Override{})
 }
 
 // NewDefaultOverrideCtx creates a new Keyfunc with a default JWK Set storage and options. The context is used to end
@@ -159,12 +152,11 @@ func NewDefaultOverrideCtx(ctx context.Context, urls []string, override Override
 				SkipAll: override.ValidationSkipAll,
 			},
 		}
-
 		if override.HTTPTimeout > 0 {
 			options.HTTPTimeout = override.HTTPTimeout
 		}
 
-		c, err := jwkset.NewStorageFromHTTP(u, options)
+		c, err := newGuardedStorageFromHTTP(u, options)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create HTTP client storage for %q: %w", u, errors.Join(err, jwkset.ErrNewClient))
 		}
@@ -209,9 +201,18 @@ func NewJWKSetJSON(raw json.RawMessage) (Keyfunc, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: could not unmarshal raw JWK Set JSON", errors.Join(err, ErrKeyfunc))
 	}
-	store, err := jwks.ToStorage()
+	jwksSlice, err := jwks.JWKSlice()
+	if err != nil {
+		return nil, fmt.Errorf("%w: could not create JWK slice from JWK Set", errors.Join(err, ErrKeyfunc))
+	}
+	jwksSlice, err = validateJWKSet(jwksSlice)
 	if err != nil {
 		return nil, fmt.Errorf("%w: could not create JWK Set storage", errors.Join(err, ErrKeyfunc))
+	}
+	store := jwkset.NewMemoryStorage()
+	err = store.KeyReplaceAll(context.Background(), jwksSlice)
+	if err != nil {
+		return nil, fmt.Errorf("%w: could not write JWK Set to storage", errors.Join(err, ErrKeyfunc))
 	}
 	options := Options{
 		Storage: store,
