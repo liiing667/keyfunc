@@ -51,6 +51,10 @@ type Override struct {
 	PrioritizeHTTP bool
 	// RateLimitWaitMax is from https://pkg.go.dev/github.com/MicahParks/jwkset#HTTPClientOptions
 	RateLimitWaitMax time.Duration
+	// RefreshBudget is the unified resource budget applied to remote JWK Set HTTP responses. It limits the response
+	// body size, the number of keys, and the size of each individual key. A refresh that exceeds the budget fails
+	// without modifying the previously cached keys. If nil, DefaultBudget is used.
+	RefreshBudget *Budget
 	// RefreshErrorHandlerFunc is a function that accepts the URL of the remote JWK Set storage and returns the
 	// RefreshErrorHandler from https://pkg.go.dev/github.com/MicahParks/jwkset#HTTPClientStorageOptions
 	RefreshErrorHandlerFunc func(u string) func(ctx context.Context, err error)
@@ -97,14 +101,7 @@ func NewDefault(urls []string) (Keyfunc, error) {
 //
 // This will launch "refresh goroutine" to automatically refresh the remote HTTP resources.
 func NewDefaultCtx(ctx context.Context, urls []string) (Keyfunc, error) {
-	client, err := jwkset.NewDefaultHTTPClientCtx(ctx, urls)
-	if err != nil {
-		return nil, err
-	}
-	options := Options{
-		Storage: client,
-	}
-	return New(options)
+	return NewDefaultOverrideCtx(ctx, urls, Override{})
 }
 
 // NewDefaultOverrideCtx creates a new Keyfunc with a default JWK Set storage and options. The context is used to end
@@ -139,6 +136,11 @@ func NewDefaultOverrideCtx(ctx context.Context, urls []string, override Override
 	if override.NoErrorReturnFirstHTTPReq != nil {
 		noErrorReturnFirstHTTPReq = *override.NoErrorReturnFirstHTTPReq
 	}
+	budget := DefaultBudget()
+	if override.RefreshBudget != nil {
+		budget = *override.RefreshBudget
+	}
+	client := budgetHTTPClient(override.Client, budget)
 
 	clientOptions := jwkset.HTTPClientOptions{
 		Given:             override.Given,
@@ -150,11 +152,15 @@ func NewDefaultOverrideCtx(ctx context.Context, urls []string, override Override
 	for _, u := range urls {
 		errorHandler := refreshErrorHandler(u)
 		options := jwkset.HTTPClientStorageOptions{
-			Client:                    override.Client,
+			Client:                    client,
 			Ctx:                       ctx,
 			NoErrorReturnFirstHTTPReq: noErrorReturnFirstHTTPReq,
 			RefreshErrorHandler:       errorHandler,
 			RefreshInterval:           refreshInterval,
+			Storage: budgetStorage{
+				Storage: jwkset.NewMemoryStorage(),
+				budget:  budget,
+			},
 			ValidateOptions: jwkset.JWKValidateOptions{
 				SkipAll: override.ValidationSkipAll,
 			},
